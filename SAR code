@@ -1,0 +1,172 @@
+# =====================================================
+# SAR Image Colorization using Conditional GANs (cGAN)
+# TensorFlow + OpenCV + Hugging Face (LLaMA captions)
+# Research-oriented, IEEE-level implementation
+# =====================================================
+
+############################################
+# 1. PROJECT STRUCTURE
+############################################
+# sar-colorization/
+# ├── data/
+# │   ├── sar_gray/
+# │   └── rgb_ground_truth/
+# ├── preprocessing.py
+# ├── model.py
+# ├── train.py
+# ├── inference.py
+# ├── caption_llama.py
+# └── requirements.txt
+
+############################################
+# 2. DATA PREPROCESSING & AUGMENTATION
+############################################
+
+# preprocessing.py
+import cv2
+import os
+import numpy as np
+
+def preprocess_image(img_path, size=(256,256)):
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    img = cv2.resize(img, size)
+    img = img / 127.5 - 1.0
+    return img
+
+def augment(img):
+    if np.random.rand() > 0.5:
+        img = cv2.flip(img, 1)
+    if np.random.rand() > 0.5:
+        img = cv2.GaussianBlur(img, (5,5), 0)
+    return img
+
+############################################
+# 3. CONDITIONAL GAN MODEL (RESNET-BASED)
+############################################
+
+# model.py
+import tensorflow as tf
+from tensorflow.keras import layers
+
+# -------- ResNet Block --------
+def resnet_block(x, filters):
+    y = layers.Conv2D(filters, 3, padding='same')(x)
+    y = layers.BatchNormalization()(y)
+    y = layers.ReLU()(y)
+    y = layers.Conv2D(filters, 3, padding='same')(y)
+    y = layers.BatchNormalization()(y)
+    return layers.Add()([x, y])
+
+# -------- Generator --------
+def build_generator():
+    inp = layers.Input(shape=(256,256,1))
+    x = layers.Conv2D(64, 7, padding='same')(inp)
+    x = layers.ReLU()(x)
+
+    for _ in range(4):
+        x = resnet_block(x, 64)
+
+    x = layers.Conv2D(3, 7, padding='same', activation='tanh')(x)
+    return tf.keras.Model(inp, x)
+
+# -------- Discriminator --------
+def build_discriminator():
+    inp_gray = layers.Input(shape=(256,256,1))
+    inp_rgb = layers.Input(shape=(256,256,3))
+    x = layers.Concatenate()([inp_gray, inp_rgb])
+    x = layers.Conv2D(64, 4, strides=2, padding='same')(x)
+    x = layers.LeakyReLU(0.2)(x)
+    x = layers.Conv2D(128, 4, strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.LeakyReLU(0.2)(x)
+    x = layers.Conv2D(1, 4, padding='same')(x)
+    return tf.keras.Model([inp_gray, inp_rgb], x)
+
+############################################
+# 4. TRAINING WITH HYBRID LOSS
+############################################
+
+# train.py
+import tensorflow as tf
+from model import build_generator, build_discriminator
+
+generator = build_generator()
+discriminator = build_discriminator()
+
+bce = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+
+# -------- Hybrid Loss --------
+def generator_loss(disc_fake, gen_output, target):
+    adv_loss = bce(tf.ones_like(disc_fake), disc_fake)
+    l1_loss = tf.reduce_mean(tf.abs(target - gen_output))
+    return adv_loss + 100 * l1_loss
+
+def discriminator_loss(disc_real, disc_fake):
+    real_loss = bce(tf.ones_like(disc_real), disc_real)
+    fake_loss = bce(tf.zeros_like(disc_fake), disc_fake)
+    return real_loss + fake_loss
+
+opt_g = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+opt_d = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+
+@tf.function
+def train_step(gray, target):
+    with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+        gen_output = generator(gray, training=True)
+        disc_real = discriminator([gray, target], training=True)
+        disc_fake = discriminator([gray, gen_output], training=True)
+        gen_loss = generator_loss(disc_fake, gen_output, target)
+        disc_loss = discriminator_loss(disc_real, disc_fake)
+
+    grads_g = gen_tape.gradient(gen_loss, generator.trainable_variables)
+    grads_d = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+    opt_g.apply_gradients(zip(grads_g, generator.trainable_variables))
+    opt_d.apply_gradients(zip(grads_d, discriminator.trainable_variables))
+
+############################################
+# 5. INFERENCE
+############################################
+
+# inference.py
+import cv2
+import tensorflow as tf
+from model import build_generator
+
+model = build_generator()
+model.load_weights('generator.h5')
+
+def colorize(img_path):
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    img = cv2.resize(img, (256,256)) / 127.5 - 1.0
+    img = img.reshape(1,256,256,1)
+    out = model.predict(img)[0]
+    out = (out + 1) / 2
+    cv2.imwrite('colorized.png', out*255)
+
+############################################
+# 6. LLaMA IMAGE INTERPRETATION (HUGGING FACE)
+############################################
+
+# caption_llama.py
+from huggingface_hub import InferenceClient
+
+client = InferenceClient(
+    model="meta-llama/Llama-3-8B-Instruct",
+    token="YOUR_HF_TOKEN"
+)
+
+def generate_caption():
+    prompt = "Describe the terrain and objects visible in this SAR colorized image." 
+    response = client.text_generation(prompt, max_new_tokens=100)
+    return response
+
+############################################
+# 7. REQUIREMENTS
+############################################
+
+# requirements.txt
+tensorflow
+opencv-python
+numpy
+huggingface-hub
+
